@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import Any, Optional
+from typing import cast, Any, Optional
+from pathlib import Path
+import re
+import sys
 
 import numpy as np
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, filedialog, messagebox
+from nibabel.nifti1 import Nifti1Image
 
 from .logic import (
     compute_color_fa,
@@ -35,9 +39,9 @@ class DTIViewerHook:
         frame = ttk.Frame(parent)
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(0, weight=1)
-        wrapper = ttk.Frame(frame, width=320, height=240)
-        wrapper.grid(row=0, column=0)
-        wrapper.grid_propagate(False)
+        wrapper = ttk.Frame(frame)
+        wrapper.grid(row=0, column=0, sticky="nsew")
+        wrapper.grid_propagate(True)
         wrapper.columnconfigure(0, weight=1)
         wrapper.rowconfigure(0, weight=1)
         panel = DTIViewerPanel(wrapper, app=app)
@@ -72,6 +76,7 @@ class DTIViewerPanel(ttk.Frame):
         self._calc_button: Optional[ttk.Button] = None
         self._map_combo: Optional[ttk.Combobox] = None
         self._reset_button: Optional[ttk.Button] = None
+        self._save_button: Optional[ttk.Button] = None
 
         self._patch_viewer_rgb_support()
         self._make_ui()
@@ -90,10 +95,10 @@ class DTIViewerPanel(ttk.Frame):
         controls.columnconfigure(1, weight=1)
 
         self._calc_button = ttk.Button(controls, text="Calculate DTI", command=self._start_calculation, width=14)
-        self._calc_button.grid(row=0, column=0, sticky="e", padx=(0, 6))
+        self._calc_button.grid(row=0, column=0, sticky="e", padx=(0, 10))
 
         self._reset_button = ttk.Button(controls, text="Reset", command=self._reset_panel, width=10)
-        self._reset_button.grid(row=0, column=1, sticky="w", padx=(6, 0))
+        self._reset_button.grid(row=0, column=1, sticky="w", padx=(10, 0))
 
         ttk.Label(controls, text="View").grid(row=1, column=0, sticky="e", pady=(6, 0), padx=(0, 6))
         self._map_combo = ttk.Combobox(
@@ -109,8 +114,21 @@ class DTIViewerPanel(ttk.Frame):
         info = ttk.Label(self, textvariable=self._info_var, anchor="center")
         info.grid(row=2, column=0, sticky="ew", pady=(8, 0))
 
-        status = ttk.Label(self, textvariable=self._status_var, anchor="center")
-        status.grid(row=3, column=0, sticky="ew", pady=(4, 0))
+        status_row = ttk.Frame(self)
+        status_row.grid(row=3, column=0, sticky="ew", pady=(4, 0))
+        status_row.columnconfigure(0, weight=1)
+        status_row.columnconfigure(1, weight=1)
+        status = ttk.Label(status_row, textvariable=self._status_var, anchor="e")
+        status.grid(row=0, column=0, sticky="e")
+
+        self._save_button = ttk.Button(
+            status_row,
+            text="Save Maps",
+            command=self._save_maps,
+            width=12,
+            state="disabled",
+        )
+        self._save_button.grid(row=0, column=1, sticky="w", padx=(10, 0))
 
     def refresh_from_viewer(self) -> None:
         # Reset internal DTI state (viewer controller owns hook state on scan/dataset change).
@@ -122,6 +140,8 @@ class DTIViewerPanel(ttk.Frame):
         self._map_var.set("DWI")
         if self._map_combo is not None:
             self._map_combo["values"] = ["DWI"]
+        if self._save_button is not None:
+            self._save_button.configure(state="disabled")
         self._info_var.set("")
         scan = self._resolve_scan_from_app()
         data = self._resolve_viewer_volume()
@@ -134,7 +154,7 @@ class DTIViewerPanel(ttk.Frame):
             self._set_status("DTI gradients not detected.")
             self._info_var.set("")
             return
-        affine = self._resolve_viewer_affine()
+        affine = cast(np.ndarray, self._resolve_viewer_affine())
         bvecs_ras = reorient_gradients(scan, bvecs, affine=affine)
         self._bvals = bvals
         self._bvecs_ras = bvecs_ras
@@ -336,13 +356,32 @@ class DTIViewerPanel(ttk.Frame):
         return self._resolve_viewer_volume()
 
     def _resolve_viewer_affine(self) -> Optional[np.ndarray]:
-        affine = getattr(self._app, "_viewer_raw_affine", None)
+        app = self._app
+        if app is None:
+            return None
+        affine = getattr(app, "_viewer_raw_affine", None)
         if affine is None:
             return None
         try:
-            return np.asarray(affine, dtype=float)
+            aff = np.asarray(affine, dtype=float)
         except Exception:
             return None
+
+        raw = getattr(app, "_viewer_raw_volume", None)
+        if raw is None:
+            return aff
+        try:
+            from brkraw_viewer.utils.orientation import reorient_to_ras
+
+            raw_arr = np.asarray(raw)
+            ras_data, ras_affine = reorient_to_ras(raw_arr, aff)
+            view_data = self._resolve_dwi_volume() or self._resolve_viewer_volume()
+            if view_data is not None:
+                if np.asarray(view_data).shape[:3] == ras_data.shape[:3]:
+                    return np.asarray(ras_affine, dtype=float)
+        except Exception:
+            return aff
+        return aff
 
     def _schedule_finalize(self) -> None:
         def update_ui() -> None:
@@ -354,8 +393,9 @@ class DTIViewerPanel(ttk.Frame):
             self._set_status("Done.")
             if self._calc_button is not None:
                 self._calc_button.configure(state="normal")
+            if self._save_button is not None:
+                self._save_button.configure(state="normal" if self._maps else "disabled")
             try:
-                from tkinter import messagebox
                 messagebox.showinfo("DTI", "DTI calculation completed.")
             except Exception:
                 pass
@@ -370,6 +410,93 @@ class DTIViewerPanel(ttk.Frame):
 
     def _set_status(self, message: str) -> None:
         self._status_var.set(message)
+
+    def _slugify_metric(self, name: str) -> str:
+        cleaned = re.sub(r"[^A-Za-z0-9]+", "_", str(name)).strip("_")
+        return cleaned or "metric"
+
+    def _resolve_output_prefix(self) -> Optional[Path]:
+        app = self._app
+        if app is None:
+            return None
+        try:
+            output_dir = Path(getattr(app, "_convert_output_dir", Path.cwd()))
+        except Exception:
+            output_dir = Path.cwd()
+        sid = getattr(getattr(app, "state", None), "dataset", None)
+        scan_id = getattr(sid, "selected_scan_id", None)
+        reco_id = getattr(sid, "selected_reco_id", None)
+        if scan_id is None or reco_id is None:
+            return None
+
+        base_path: Optional[Path] = None
+        planner = getattr(app, "_plan_output_paths", None)
+        if callable(planner):
+            planned = planner(
+                output_dir=output_dir,
+                base_name="",
+                scan_id=int(scan_id),
+                reco_id=int(reco_id),
+                layout_source=getattr(app, "_convert_layout_source", None),
+                layout_auto=getattr(app, "_convert_layout_auto", None),
+                layout_template=getattr(app, "_convert_layout_template", None),
+                context_map=getattr(app, "_context_map_path", None),
+            )
+            if isinstance(planned, (list, tuple)) and planned:
+                base_path = Path(str(planned[0]))
+
+        if base_path is None:
+            base = f"scan{int(scan_id):03d}_reco{int(reco_id):03d}"
+            base_path = output_dir / f"{base}.nii.gz"
+
+        name = base_path.name
+        if name.endswith(".nii.gz"):
+            name = name[: -len(".nii.gz")]
+        elif name.endswith(".nii"):
+            name = name[: -len(".nii")]
+        prefix = base_path.with_name(name)
+
+        confirm = messagebox.askyesno(
+            "DTI",
+            f"Save DTI maps to:\n{prefix}_<metric>.nii.gz\n\nProceed?",
+        )
+        if not confirm:
+            return None
+        return prefix
+
+    def _save_maps(self) -> None:
+        if not self._maps:
+            self._set_status("No DTI maps to save.")
+            return
+        prefix = self._resolve_output_prefix()
+        if prefix is None:
+            return
+        affine = self._resolve_viewer_affine()
+        if affine is None:
+            affine = np.eye(4, dtype=float)
+
+        errors: list[str] = []
+        for name, data in self._maps.items():
+            if data is None:
+                continue
+            try:
+                arr = np.asarray(data)
+                if arr.ndim == 0:
+                    continue
+                out_name = f"{prefix}_{self._slugify_metric(name)}.nii.gz"
+                nii = Nifti1Image(arr.astype(np.float32, copy=False), affine)
+                nii.to_filename(out_name)
+            except Exception as exc:
+                errors.append(f"{name}: {exc}")
+
+        if errors:
+            self._set_status("Some DTI maps failed to save.")
+            try:
+                messagebox.showwarning("DTI", "Save errors:\n" + "\n".join(errors))
+            except Exception:
+                pass
+            return
+        self._set_status("DTI maps saved.")
 
     def _lock_viewer_hook(self, locked: bool) -> None:
         app = self._app
@@ -456,7 +583,8 @@ def _render_rgb_views(app: Any, data: np.ndarray) -> None:
             "zy": img_zy,
         },
         indices=(xi, yi, zi),
-        res={"xy": (float(rx), float(ry)), "xz": (float(rx), float(rz)), "zy": (float(rz), float(ry))},
+        # Match main viewer: (row_res, col_res) for each view.
+        res={"xy": (float(ry), float(rx)), "xz": (float(rz), float(rx)), "zy": (float(ry), float(rz))},
         crosshair=None,
         show_crosshair=bool(getattr(viewer_state, "crosshair", False)),
     )

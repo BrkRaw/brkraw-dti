@@ -126,9 +126,15 @@ def convert(
     """
     bvals, bvecs = get_gradients(scan)
 
-    first_affine = affine[0] if isinstance(affine, tuple) else affine
     if bvecs is not None:
-        bvecs = reorient_gradients(scan, bvecs, affine=first_affine)
+        # Conversion keeps image axes in the original acquisition space;
+        # do not reorient gradients for file export.
+        try:
+            norms = np.linalg.norm(np.asarray(bvecs), axis=1)
+            if np.all(norms <= 0):
+                logger.warning("DTI bvecs are all zeros after parsing; check gradient parameters.")
+        except Exception:
+            logger.warning("DTI bvecs validation failed; check gradient parameters.")
 
     dataobjs = list(_normalize_sequence(dataobj))
     affines = list(_normalize_sequence(affine))

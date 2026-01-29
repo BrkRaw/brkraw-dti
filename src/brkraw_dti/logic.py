@@ -136,7 +136,7 @@ def reorient_gradients(
     scan: Any,
     bvecs: np.ndarray,
     *,
-    affine: Optional[np.ndarray] = None,
+    affine: np.ndarray,
 ) -> np.ndarray:
     """
     Reorient gradient vectors from Logical (Read/Phase/Slice) to 
