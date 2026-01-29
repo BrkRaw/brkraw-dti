@@ -47,6 +47,12 @@ class DTIViewerHook:
         panel = DTIViewerPanel(wrapper, app=app)
         panel.grid(row=0, column=0, sticky="n")
         panel.refresh_from_viewer()
+        register = getattr(app, "register_viewer_space_listener", None)
+        if callable(register):
+            try:
+                register(panel.on_viewer_space_change)
+            except Exception:
+                pass
         self._panel = panel
         return frame
 
@@ -68,6 +74,7 @@ class DTIViewerPanel(ttk.Frame):
         self._bvecs_ras: Optional[np.ndarray] = None
         self._calc_thread: Optional[threading.Thread] = None
         self._viewer_cache: dict[str, Any] = {}
+        self._last_space: Optional[str] = None
 
         self._status_var = tk.StringVar(value="")
         self._info_var = tk.StringVar(value="")
@@ -78,7 +85,6 @@ class DTIViewerPanel(ttk.Frame):
         self._reset_button: Optional[ttk.Button] = None
         self._save_button: Optional[ttk.Button] = None
 
-        self._patch_viewer_rgb_support()
         self._make_ui()
 
     def _make_ui(self) -> None:
@@ -143,6 +149,7 @@ class DTIViewerPanel(ttk.Frame):
         if self._save_button is not None:
             self._save_button.configure(state="disabled")
         self._info_var.set("")
+        self._last_space = None
         scan = self._resolve_scan_from_app()
         data = self._resolve_viewer_volume()
         if scan is None:
@@ -189,6 +196,69 @@ class DTIViewerPanel(ttk.Frame):
             f"Dirs: {dir_count}  b0: {b0_count}  {shape_text}"
         )
         self._set_status("Ready.")
+        self._last_space = self._read_viewer_space()
+
+    def _read_viewer_space(self) -> Optional[str]:
+        app = self._app
+        if app is None:
+            return None
+        state = getattr(app, "state", None)
+        viewer_state = getattr(state, "viewer", None) if state is not None else None
+        if viewer_state is None:
+            return None
+        try:
+            return str(getattr(viewer_state, "space", None) or "")
+        except Exception:
+            return None
+
+    def _read_viewer_flip(self) -> tuple[bool, bool, bool]:
+        app = self._app
+        if app is None:
+            return (False, False, False)
+        state = getattr(app, "state", None)
+        viewer_state = getattr(state, "viewer", None) if state is not None else None
+        if viewer_state is None:
+            return (False, False, False)
+        return (
+            bool(getattr(viewer_state, "flip_x", False)),
+            bool(getattr(viewer_state, "flip_y", False)),
+            bool(getattr(viewer_state, "flip_z", False)),
+        )
+
+    def _apply_flip_to_data_affine(
+        self,
+        data: np.ndarray,
+        affine: np.ndarray,
+        *,
+        flip_x: bool,
+        flip_y: bool,
+        flip_z: bool,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        arr = np.asarray(data)
+        if arr.ndim < 3:
+            return arr, affine
+        dims = arr.shape[:3]
+        out_affine = np.asarray(affine, dtype=float)
+        for axis, flag in enumerate((flip_x, flip_y, flip_z)):
+            if not flag:
+                continue
+            arr = np.flip(arr, axis=axis)
+            flip_mat = np.eye(4, dtype=float)
+            flip_mat[axis, axis] = -1.0
+            flip_mat[axis, 3] = float(dims[axis] - 1)
+            out_affine = out_affine @ flip_mat
+        arr = np.ascontiguousarray(arr)
+        return arr, out_affine
+
+    def on_viewer_space_change(self, value: str) -> None:
+        new_space = str(value or "")
+        if self._last_space == new_space:
+            return
+        self._last_space = new_space
+        if self._maps:
+            self._reset_panel()
+        else:
+            self._set_status("Space changed.")
 
     def _start_calculation(self) -> None:
         if self._calc_thread is not None and self._calc_thread.is_alive():
@@ -362,6 +432,28 @@ class DTIViewerPanel(ttk.Frame):
         affine = getattr(app, "_viewer_raw_affine", None)
         if affine is None:
             return None
+        if isinstance(affine, (list, tuple)):
+            try:
+                arr = np.asarray(affine, dtype=float)
+            except Exception:
+                arr = None
+            if arr is not None:
+                # (N,4,4) slice pack affines
+                if arr.ndim == 3:
+                    idx = 0
+                    try:
+                        state = getattr(app, "state", None)
+                        viewer_state = getattr(state, "viewer", None) if state is not None else None
+                        if viewer_state is not None:
+                            idx = int(getattr(viewer_state, "slicepack_index", 0) or 0)
+                    except Exception:
+                        idx = 0
+                    if idx < 0 or idx >= arr.shape[0]:
+                        idx = 0
+                    affine = arr[idx]
+                # (4,4) single affine expressed as list of lists
+                elif arr.ndim == 2:
+                    affine = arr
         try:
             aff = np.asarray(affine, dtype=float)
         except Exception:
@@ -375,7 +467,9 @@ class DTIViewerPanel(ttk.Frame):
 
             raw_arr = np.asarray(raw)
             ras_data, ras_affine = reorient_to_ras(raw_arr, aff)
-            view_data = self._resolve_dwi_volume() or self._resolve_viewer_volume()
+            view_data = self._resolve_dwi_volume()
+            if view_data is None:
+                view_data = self._resolve_viewer_volume()
             if view_data is not None:
                 if np.asarray(view_data).shape[:3] == ras_data.shape[:3]:
                     return np.asarray(ras_affine, dtype=float)
@@ -474,7 +568,6 @@ class DTIViewerPanel(ttk.Frame):
         affine = self._resolve_viewer_affine()
         if affine is None:
             affine = np.eye(4, dtype=float)
-
         errors: list[str] = []
         for name, data in self._maps.items():
             if data is None:
@@ -530,64 +623,6 @@ class DTIViewerPanel(ttk.Frame):
             except Exception:
                 pass
 
-    def _patch_viewer_rgb_support(self) -> None:
-        # Viewer core now handles RGB mode with a toggle.
-        return
-
-
-def _render_rgb_views(app: Any, data: np.ndarray) -> None:
-    view = getattr(app, "_view", None)
-    state = getattr(app, "state", None)
-    if view is None or state is None:
-        return
-    viewer_state = getattr(state, "viewer", None)
-    if viewer_state is None:
-        return
-    try:
-        x, y, z = data.shape[:3]
-    except Exception:
-        return
-    xi = min(max(int(getattr(viewer_state, "x_index", 0)), 0), max(x - 1, 0))
-    yi = min(max(int(getattr(viewer_state, "y_index", 0)), 0), max(y - 1, 0))
-    zi = min(max(int(getattr(viewer_state, "z_index", 0)), 0), max(z - 1, 0))
-
-    img_zy = data[xi, :, :, :]
-    img_xy = data[:, :, zi, :].transpose(1, 0, 2)
-    img_xz = data[:, yi, :, :].transpose(1, 0, 2)
-
-    zoom = max(1.0, float(getattr(viewer_state, "zoom", 1.0)))
-    if zoom > 1.0:
-        img_xy = _crop_view(img_xy, center=(yi, xi), zoom=zoom)
-        img_xz = _crop_view(img_xz, center=(zi, xi), zoom=zoom)
-        img_zy = _crop_view(img_zy, center=(yi, zi), zoom=zoom)
-
-    res = getattr(app, "_viewer_res", (1.0, 1.0, 1.0))
-    rx, ry, rz = res
-
-    view.set_viewer_ranges(
-        x=x,
-        y=y,
-        z=z,
-        frames=1,
-        slicepacks=getattr(app, "_viewer_slicepacks", 1),
-        indices=(xi, yi, zi),
-        frame=0,
-        slicepack=getattr(viewer_state, "slicepack_index", 0),
-        extra_dims=None,
-        extra_indices=None,
-    )
-    view.set_viewer_views(
-        {
-            "xy": img_xy,
-            "xz": img_xz,
-            "zy": img_zy,
-        },
-        indices=(xi, yi, zi),
-        # Match main viewer: (row_res, col_res) for each view.
-        res={"xy": (float(ry), float(rx)), "xz": (float(rz), float(rx)), "zy": (float(ry), float(rz))},
-        crosshair=None,
-        show_crosshair=bool(getattr(viewer_state, "crosshair", False)),
-    )
 
 
 def _crop_view(img: np.ndarray, *, center: tuple[int, int], zoom: float) -> np.ndarray:
