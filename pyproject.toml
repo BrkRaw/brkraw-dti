@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=67", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "brkraw-dti"
+version = "0.1.0"
+description = "BrkRaw extension for Diffusion Tensor Imaging (DTI) support"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [{name = "BrkRaw User"}]
+dependencies = [
+    "brkraw>=0.5.5",
+    "numpy",
+    "scipy",
+    "nibabel",
+]
+
+[project.entry-points."brkraw.converter_hook"]
+dti = "brkraw_dti.hook:HOOK"
+
+[project.entry-points."brkraw.viewer.hook"]
+dti_viewer = "brkraw_dti.viewer_hook:ViewerHook"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+packages = ["brkraw_dti"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+brkraw_dti = [
+    "brkraw_hook.yaml",
+    "docs.md",
+    "rules/*.yaml",
+    "specs/*.yaml",
+    "transforms/*.py",
+]

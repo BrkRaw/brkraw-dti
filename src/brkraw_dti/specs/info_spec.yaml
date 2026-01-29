@@ -1,0 +1,53 @@
+__meta__:
+  name: "dti_info"
+  version: "0.1.0"
+  description: "DTI info spec for BrkRaw CLI"
+  category: "info_spec"
+
+Method:
+  sources:
+    - file: method
+      key: Method
+
+Protocol:
+  sources:
+    - file: acqp
+      key: ACQ_protocol_name
+
+# Diffusion Params
+BValues:
+  sources:
+    - file: method
+      key: PVM_DwEffBval
+    - file: method
+      key: PVM_DwBVal
+
+NumDirections:
+  sources:
+    - file: method
+      key: PVM_DwNDiffDir
+
+DiffusionMode:
+  sources:
+    - file: method
+      key: PVM_DwPrepMode
+
+TE (ms):
+  sources:
+    - file: method
+      key: PVM_EchoTime
+
+TR (ms):
+  sources:
+    - file: method
+      key: PVM_RepetitionTime
+
+Shape:
+  sources:
+    - file: method
+      key: PVM_Matrix
+
+FOV (mm):
+  sources:
+    - file: method
+      key: PVM_Fov

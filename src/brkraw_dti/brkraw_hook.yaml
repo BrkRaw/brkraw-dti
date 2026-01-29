@@ -1,0 +1,9 @@
+# BrkRaw-DTI Hook Manifest
+docs: docs.md
+specs:
+  - specs/info_spec.yaml
+  - specs/metadata_spec.yaml
+rules:
+  - rules/dti.yaml
+transforms:
+  - transforms/utils.py

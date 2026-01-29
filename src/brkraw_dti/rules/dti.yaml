@@ -1,0 +1,35 @@
+converter_hook:
+  - name: "dti-hook"
+    description: "Automatic DTI bvec/bval export hook."
+    when:
+      diff_dir:
+        sources:
+          - file: method
+            key: PVM_DwNDiffDir
+    if:
+      regex: ["$diff_dir", "^[1-9][0-9]*$"]
+    use: "dti"
+
+info_spec:
+  - name: "dti-info"
+    description: "DTI scan info display."
+    when:
+      diff_dir:
+        sources:
+          - file: method
+            key: PVM_DwNDiffDir
+    if:
+      regex: ["$diff_dir", "^[1-9][0-9]*$"]
+    use: "dti_info"
+
+metadata_spec:
+  - name: "dti-metadata"
+    description: "DTI JSON sidecar metadata."
+    when:
+      diff_dir:
+        sources:
+          - file: method
+            key: PVM_DwNDiffDir
+    if:
+      regex: ["$diff_dir", "^[1-9][0-9]*$"]
+    use: "dti_metadata"

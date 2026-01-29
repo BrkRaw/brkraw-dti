@@ -1,0 +1,71 @@
+__meta__:
+  name: "dti_metadata"
+  version: "0.1.0"
+  description: "DTI metadata spec for NIfTI sidecar"
+  category: "metadata_spec"
+
+# BIDS-like Diffusion Fields
+DiffusionScheme:
+  inputs:
+    value:
+      const: "Monopolar"
+
+BValues: 
+  sources:
+    - file: method
+      key: PVM_DwEffBval
+    - file: method
+      key: PVM_DwBVal
+
+DiffusionGradientVector:
+  sources:
+    - file: method
+      key: PVM_DwGradVec
+
+NumberDiffusionDirections:
+  sources:
+    - file: method
+      key: PVM_DwNDiffDir
+
+DiffusionPreparation:
+  sources:
+    - file: method
+      key: PVM_DwPrepMode
+
+EchoSpacing:
+  sources:
+    - file: method
+      key: PVM_EpiEchoSpacing
+
+# Standard MRI fields
+RepetitionTime:
+  sources:
+    - file: method
+      key: PVM_RepetitionTime
+  transform: ms_to_s
+
+EchoTime:
+  sources:
+    - file: method
+      key: PVM_EchoTime
+  transform: ms_to_s
+
+FlipAngle:
+  sources:
+    - file: acqp
+      key: ACQ_flip_angle
+  transform: first_float
+
+MagneticFieldStrength:
+  sources:
+    - file: acqp
+      key: BF1
+  transform: first_float
+
+Manufacturer:
+
+  inputs:
+
+    value:
+
+      const: "Bruker"
