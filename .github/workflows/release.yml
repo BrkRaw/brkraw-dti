@@ -1,0 +1,145 @@
+name: Create Release
+
+on:
+  push:
+    tags:
+      - "*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v1.2.3)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  discussions: write
+  id-token: write
+  actions: write
+
+jobs:
+  release:
+    if: ${{ github.repository == 'BrkRaw/brkraw-dti' }}
+    runs-on: ubuntu-latest
+    outputs:
+      prerelease: ${{ steps.prerelease.outputs.value }}
+      tag: ${{ steps.tag.outputs.value }}
+    steps:
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "value=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.value }}
+      - name: Detect prerelease tag
+        id: prerelease
+        run: |
+          tag="${{ steps.tag.outputs.value }}"
+          if echo "$tag" | grep -Eq '(a|b|rc)[0-9]*$'; then
+            echo "value=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.value }}
+          name: ${{ steps.tag.outputs.value }}
+          body_path: RELEASE_NOTES.md
+          prerelease: ${{ steps.prerelease.outputs.value }}
+      - name: Post release announcement
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          TAG_NAME: ${{ steps.tag.outputs.value }}
+          RELEASE_URL: https://github.com/${{ github.repository }}/releases/tag/${{ steps.tag.outputs.value }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          from urllib import request
+
+          token = os.environ.get("GITHUB_TOKEN")
+          repo = os.environ["GITHUB_REPOSITORY"]
+          tag = os.environ["TAG_NAME"]
+          release_url = os.environ["RELEASE_URL"]
+          owner, name = repo.split("/")
+
+          notes_path = Path("RELEASE_NOTES.md")
+          notes = notes_path.read_text(encoding="utf-8").strip() if notes_path.exists() else ""
+          title = f"Release {tag}"
+          body = f"[Release {tag}]({release_url})"
+          if notes:
+              body = f"{body}\n\n{notes}"
+
+          query = {
+              "query": """
+              query($owner: String!, $name: String!) {
+                repository(owner: $owner, name: $name) {
+                  id
+                  discussionCategories(first: 50) {
+                    nodes { id name }
+                  }
+                }
+              }
+              """,
+              "variables": {"owner": owner, "name": name},
+          }
+
+          req = request.Request("https://api.github.com/graphql", method="POST")
+          req.add_header("Authorization", f"Bearer {token}")
+          req.add_header("Content-Type", "application/json")
+          data = json.dumps(query).encode("utf-8")
+          with request.urlopen(req, data=data) as resp:
+              payload = json.loads(resp.read().decode("utf-8"))
+
+          repo_data = payload.get("data", {}).get("repository", {})
+          category_id = None
+          for node in repo_data.get("discussionCategories", {}).get("nodes", []):
+              if node.get("name") == "Announcements":
+                  category_id = node.get("id")
+                  break
+          if not category_id:
+              print("Announcements category not found; skipping discussion.")
+              raise SystemExit(0)
+
+          mutation = {
+              "query": """
+              mutation($repoId: ID!, $categoryId: ID!, $title: String!, $body: String!) {
+                createDiscussion(input: {repositoryId: $repoId, categoryId: $categoryId, title: $title, body: $body}) {
+                  discussion { id url }
+                }
+              }
+              """,
+              "variables": {
+                  "repoId": repo_data.get("id"),
+                  "categoryId": category_id,
+                  "title": title,
+                  "body": body,
+              },
+          }
+
+          req = request.Request("https://api.github.com/graphql", method="POST")
+          req.add_header("Authorization", f"Bearer {token}")
+          req.add_header("Content-Type", "application/json")
+          data = json.dumps(mutation).encode("utf-8")
+          with request.urlopen(req, data=data) as resp:
+              result = json.loads(resp.read().decode("utf-8"))
+          url = result.get("data", {}).get("createDiscussion", {}).get("discussion", {}).get("url")
+          if url:
+              print(f"Created discussion: {url}")
+          PY
+
+      - name: Trigger publish workflow
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          target="${{ steps.prerelease.outputs.value == 'true' && 'testpypi' || 'pypi' }}"
+          tag="${{ steps.tag.outputs.value }}"
+          gh workflow run publish.yml -f target="$target" -f tag="$tag"

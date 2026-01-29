@@ -1,0 +1,456 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import logging
+import re
+import subprocess
+import time
+from pathlib import Path
+from typing import Iterable, Literal
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+RELEASE_NOTES_PATH = REPO_ROOT / "RELEASE_NOTES.md"
+PYPROJECT_PATH = REPO_ROOT / "pyproject.toml"
+
+logger = logging.getLogger(__name__)
+
+
+def run_git(args: Iterable[str], check: bool = True) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(
+        ["git", *args],
+        cwd=REPO_ROOT,
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    if check and result.returncode != 0:
+        msg = result.stderr.strip() or result.stdout.strip()
+        raise SystemExit(f"git {' '.join(args)} failed: {msg}")
+    return result
+
+
+def run_cmd(args: list[str], check: bool = True) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(
+        args,
+        cwd=REPO_ROOT,
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    if check and result.returncode != 0:
+        msg = result.stderr.strip() or result.stdout.strip()
+        raise SystemExit(f"{args[0]} failed: {msg}")
+    return result
+
+
+def require_clean_worktree() -> None:
+    status = run_git(["status", "--porcelain"], check=True).stdout.strip()
+    if status:
+        raise SystemExit("Working tree is not clean. Commit or stash changes first.")
+
+
+def get_current_branch() -> str:
+    return run_git(["rev-parse", "--abbrev-ref", "HEAD"], check=True).stdout.strip()
+
+
+def get_remote_url(remote: str) -> str:
+    return run_git(["remote", "get-url", remote], check=True).stdout.strip()
+
+
+def parse_owner_repo(remote_url: str) -> tuple[str, str]:
+    cleaned = remote_url.rstrip("/")
+    match = re.search(r"[:/](?P<owner>[^/]+)/(?P<repo>[^/]+)$", cleaned)
+    if not match:
+        raise SystemExit(f"Could not parse owner/repo from remote URL: {remote_url}")
+    repo = match.group("repo")
+    if repo.endswith(".git"):
+        repo = repo[: -len(".git")]
+    return match.group("owner"), repo
+
+
+def ensure_remote_branch(remote: str, branch: str, *, dry_run: bool) -> None:
+    if dry_run:
+        logger.info("[dry-run] Would ensure remote branch exists: %s/%s", remote, branch)
+        return
+    head = run_git(["ls-remote", "--heads", remote, branch], check=True).stdout.strip()
+    if not head:
+        run_git(["push", "-u", remote, f"HEAD:{branch}"], check=True)
+
+
+def has_changes(paths: Iterable[Path]) -> bool:
+    for path in paths:
+        rel = str(path.relative_to(REPO_ROOT))
+        diff = run_git(["diff", "--name-only", rel], check=True).stdout.strip()
+        if diff:
+            return True
+    return False
+
+
+def list_changed(paths: Iterable[Path]) -> list[str]:
+    changed: list[str] = []
+    for path in paths:
+        rel = str(path.relative_to(REPO_ROOT))
+        diff = run_git(["diff", "--name-only", rel], check=True).stdout.strip()
+        if diff:
+            changed.append(rel)
+    return changed
+
+
+def commit_if_changed(
+    message: str,
+    paths: Iterable[Path],
+    *,
+    label: str,
+    dry_run: bool,
+) -> bool:
+    if not has_changes(paths):
+        logger.info("No %s changes detected; skipping commit.", label)
+        return False
+
+    changed = list_changed(paths)
+    if dry_run:
+        logger.info("[dry-run] Would commit (%s): %s", label, message)
+        for p in changed:
+            logger.info("[dry-run]   - %s", p)
+        return True
+
+    for path in paths:
+        run_git(["add", str(path.relative_to(REPO_ROOT))], check=True)
+    run_git(["commit", "-m", message], check=True)
+    return True
+
+
+def gh_pr_number(
+    upstream_repo: str, head_ref: str, state: Literal["open", "closed", "all"] = "open"
+) -> str | None:
+    owner, repo = upstream_repo.split("/", 1)
+    result = run_cmd(
+        [
+            "gh",
+            "api",
+            f"repos/{owner}/{repo}/pulls",
+            "-X",
+            "GET",
+            "-f",
+            f"head={head_ref}",
+            "-f",
+            f"state={state}",
+            "--jq",
+            ".[0].number",
+        ],
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    value = result.stdout.strip()
+    return value or None
+
+
+def gh_pr_create(
+    upstream_repo: str, base_branch: str, head_ref: str, title: str, body: str, *, dry_run: bool
+) -> str | None:
+    if dry_run:
+        logger.info(
+            "[dry-run] Would create PR in %s: base=%s, head=%s",
+            upstream_repo,
+            base_branch,
+            head_ref,
+        )
+        logger.info("[dry-run] Title: %s", title)
+        return None
+    owner, repo = upstream_repo.split("/", 1)
+    result = run_cmd(
+        [
+            "gh",
+            "api",
+            f"repos/{owner}/{repo}/pulls",
+            "-X",
+            "POST",
+            "-f",
+            f"title={title}",
+            "-f",
+            f"head={head_ref}",
+            "-f",
+            f"base={base_branch}",
+            "-f",
+            f"body={body}",
+            "--jq",
+            ".number",
+        ]
+    )
+    value = result.stdout.strip()
+    return value or None
+
+
+def gh_pr_edit(upstream_repo: str, pr_number: str, body: str, *, dry_run: bool) -> None:
+    if dry_run:
+        logger.info(
+            "[dry-run] Would edit PR #%s in %s (update body)",
+            pr_number,
+            upstream_repo,
+        )
+        return
+    owner, repo = upstream_repo.split("/", 1)
+    run_cmd(
+        [
+            "gh",
+            "api",
+            f"repos/{owner}/{repo}/pulls/{pr_number}",
+            "-X",
+            "PATCH",
+            "-f",
+            f"body={body}",
+        ]
+    )
+
+
+def gh_pr_add_label(upstream_repo: str, pr_number: str, label: str, *, dry_run: bool) -> None:
+    if dry_run:
+        logger.info(
+            "[dry-run] Would add label '%s' to PR #%s in %s",
+            label,
+            pr_number,
+            upstream_repo,
+        )
+        return
+    owner, repo = upstream_repo.split("/", 1)
+    run_cmd(
+        [
+            "gh",
+            "api",
+            f"repos/{owner}/{repo}/issues/{pr_number}/labels",
+            "-X",
+            "POST",
+            "-f",
+            f"labels[]={label}",
+        ]
+    )
+
+
+def ensure_pr(
+    *,
+    upstream_repo_full: str,
+    base_branch: str,
+    head_ref: str,
+    title: str,
+    body: str,
+    no_pr: bool,
+    dry_run: bool,
+) -> str | None:
+    if no_pr:
+        logger.info("[no-pr] PR operations disabled; skipping PR lookup/create.")
+        return None
+
+    pr_number = gh_pr_number(upstream_repo_full, head_ref, state="open")
+    if pr_number:
+        logger.info(
+            "Existing PR found for %s (head=%s): #%s",
+            upstream_repo_full,
+            head_ref,
+            pr_number,
+        )
+        return pr_number
+
+    created_pr = gh_pr_create(
+        upstream_repo_full,
+        base_branch,
+        head_ref,
+        title,
+        body,
+        dry_run=dry_run,
+    )
+    if dry_run:
+        return "DRY_RUN_PR"
+    if created_pr:
+        return created_pr
+
+    pr_number = None
+    for attempt in range(5):
+        pr_number = gh_pr_number(upstream_repo_full, head_ref, state="open")
+        if pr_number:
+            break
+        if attempt < 4:
+            logger.info("Waiting for PR to become visible (%s/5)...", attempt + 1)
+            time.sleep(3)
+    if not pr_number:
+        raise SystemExit("PR created but could not retrieve PR number.")
+    else:
+        logger.info("Created PR #%s", pr_number)
+    return pr_number
+
+
+def is_prerelease(version: str) -> bool:
+    return bool(re.search(r"(a|b|rc)\d*$", version.lower()))
+
+
+def get_changed_files(base_ref: str) -> list[str]:
+    base_ref = base_ref.strip()
+    merge_base = run_git(["merge-base", base_ref, "HEAD"], check=False)
+    if merge_base.returncode == 0:
+        base_sha = merge_base.stdout.strip()
+        diff_result = run_git(["diff", "--name-only", f"{base_sha}..HEAD"], check=True)
+    else:
+        diff_result = run_git(["diff", "--name-only", f"{base_ref}..HEAD"], check=False)
+        if diff_result.returncode != 0:
+            diff_result = run_git(["diff", "--name-only", "HEAD~3..HEAD"], check=True)
+    return [line.strip() for line in diff_result.stdout.splitlines() if line.strip()]
+
+
+def update_version_files(version: str) -> None:
+    pyproject_text = PYPROJECT_PATH.read_text(encoding="utf-8")
+    pyproject_updated = re.sub(
+        r'(?m)^(version\s*=\s*["\'])([^"\']+)(["\'])',
+        rf"\g<1>{version}\g<3>",
+        pyproject_text,
+        count=1,
+    )
+    if pyproject_text == pyproject_updated:
+        raise SystemExit("Could not update version in pyproject.toml.")
+    PYPROJECT_PATH.write_text(pyproject_updated, encoding="utf-8")
+
+
+
+def generate_release_notes(version: str, upstream_ref: str) -> None:
+    tag_result = run_git(["describe", "--tags", "--abbrev=0", upstream_ref], check=False)
+    last_tag = tag_result.stdout.strip() if tag_result.returncode == 0 else None
+    log_range = f"{last_tag}..HEAD" if last_tag else "HEAD"
+
+    log_result = run_git(
+        ["log", log_range, "--no-merges", "--pretty=format:- %s (%h)"], check=True
+    )
+    changes = log_result.stdout.strip() or "- (no changes found)"
+
+    date_str = dt.date.today().isoformat()
+    header = f"# Release v{version}\n\n"
+    meta = f"Date: {date_str}\n"
+    scope = f"Changes since {last_tag}\n\n" if last_tag else "Changes\n\n"
+    RELEASE_NOTES_PATH.write_text(header + meta + scope + changes + "\n", encoding="utf-8")
+
+
+def build_pr_body(version: str, files_block: str) -> str:
+    return (
+        f"## Release v{version}\n\n"
+        "### Summary\n"
+        "- Bump package version and metadata\n"
+        "- Generate release notes\n\n"
+        "### Files updated\n"
+        f"{files_block}\n\n"
+        "### Checklist\n"
+        "- [ ] CI passes\n"
+        "- [ ] Release notes look correct\n"
+        "- [ ] `release` label applied\n"
+        "- [ ] Tag on merge\n"
+    )
+
+
+def main() -> int:
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    parser = argparse.ArgumentParser(
+        description="Create a release prep PR and commit version + release notes changes."
+    )
+    parser.add_argument("--version", required=True, help="Release version (PEP 440)")
+    parser.add_argument("--base", default="upstream/main", help="Base ref for PR (default: upstream/main)")
+    parser.add_argument("--remote-upstream", default="upstream", help="Remote name for upstream (default: upstream)")
+    parser.add_argument("--remote-origin", default="origin", help="Remote name for fork/origin (default: origin)")
+    parser.add_argument("--pr-title", default=None, help="PR title (default: Release vX.Y.Z)")
+    parser.add_argument("--pr-body", default=None, help="PR body (default: formatted release prep template)")
+    parser.add_argument("--prep-message", default="chore: prepare release v{version}", help="Commit message for version bump")
+    parser.add_argument("--notes-message", default="docs: release notes for v{version}", help="Commit message for release notes")
+
+    parser.add_argument(
+        "--no-pr",
+        action="store_true",
+        help="Do not create or update a GitHub PR (commits/push still run).",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would happen without committing, pushing, or creating/editing PRs.",
+    )
+
+    parser.add_argument(
+        "--allow-dirty",
+        action="store_true",
+        help="Allow running with a dirty working tree (useful with --dry-run).",
+    )
+
+    args = parser.parse_args()
+
+    if not args.allow_dirty and not args.dry_run:
+        require_clean_worktree()
+    else:
+        logger.warning("⚠️  Dirty working tree allowed (dry-run or --allow-dirty).")
+
+    branch = get_current_branch()
+    upstream_owner, upstream_repo = parse_owner_repo(get_remote_url(args.remote_upstream))
+    origin_owner, _ = parse_owner_repo(get_remote_url(args.remote_origin))
+
+    base_branch = args.base.split("/", 1)[1] if "/" in args.base else args.base
+    upstream_repo_full = f"{upstream_owner}/{upstream_repo}"
+    head_ref = f"{origin_owner}:{branch}"
+
+    # 1) release prep changes
+    update_version_files(args.version)
+    release_prep_group = [PYPROJECT_PATH]
+    commit_if_changed(
+        args.prep_message.format(version=args.version),
+        release_prep_group,
+        label="release prep",
+        dry_run=args.dry_run,
+    )
+
+    # 2) release notes
+    generate_release_notes(args.version, args.base)
+    commit_if_changed(
+        args.notes_message.format(version=args.version),
+        [RELEASE_NOTES_PATH],
+        label="release notes",
+        dry_run=args.dry_run,
+    )
+
+    ensure_remote_branch(args.remote_origin, branch, dry_run=args.dry_run)
+
+    # PR body update + label (if enabled)
+    if args.dry_run:
+        logger.info("[dry-run] Would push branch to %s: %s", args.remote_origin, branch)
+    else:
+        run_git(["push", args.remote_origin, f"HEAD:{branch}"], check=True)
+
+    title = args.pr_title or f"Release v{args.version}"
+    initial_body = args.pr_body or build_pr_body(args.version, "- (pending)")
+
+    ahead_count_result = run_git(["rev-list", "--count", f"{args.base}..HEAD"], check=False)
+    if ahead_count_result.returncode == 0:
+        try:
+            ahead_count = int(ahead_count_result.stdout.strip() or "0")
+        except ValueError:
+            ahead_count = 0
+    else:
+        ahead_count = 0
+
+    pr_number = ensure_pr(
+        upstream_repo_full=upstream_repo_full,
+        base_branch=base_branch,
+        head_ref=head_ref,
+        title=title,
+        body=initial_body,
+        no_pr=args.no_pr,
+        dry_run=args.dry_run,
+    )
+
+    if pr_number and (not args.no_pr):
+        changed_files = get_changed_files(args.base)
+        files_block = "\n".join(f"- `{p}`" for p in changed_files) if changed_files else "- (none)"
+        final_body = args.pr_body or build_pr_body(args.version, files_block)
+        gh_pr_edit(upstream_repo_full, pr_number, final_body, dry_run=args.dry_run)
+
+        if (not is_prerelease(args.version)) and (not args.dry_run):
+            gh_pr_add_label(upstream_repo_full, pr_number, "release", dry_run=args.dry_run)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
