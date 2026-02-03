@@ -1,34 +1,42 @@
 # BrkRaw DTI Extension
 
-This hook provides **Diffusion Tensor Imaging (DTI)** support for BrkRaw.
+This hook adds **Diffusion Tensor Imaging (DTI)** support to **BrkRaw**, providing both conversion and quality-control tools for diffusion datasets.
 
 ## Features
 
-1.  **DTI Conversion**:
-    *   Automatically exports `.bval` and `.bvec` (FSL format) files alongside the NIfTI image.
-    *   Correctly reorients gradient vectors (`bvecs`) from the logical frame to the image frame (RAS+).
+### 1. DTI Conversion
+- Automatically exports .bval and .bvec files (FSL format) alongside the converted NIfTI image.
+- Correctly reorients diffusion gradient vectors (bvecs) from the logical acquisition frame to the image frame (RAS+) using the affine.
 
-2.  **DTI Viewer & QC**:
-    *   Adds a **DTI Tab** to the BrkRaw Viewer.
-    *   **Calculate DTI**: Performs real-time Tensor fitting (OLS).
-    *   **Visualization**: Displays Fractional Anisotropy (FA), Mean Diffusivity (MD), and **Directionally Encoded Color FA (DEC-FA)** maps directly in the viewer.
-    *   **DEC-FA QC**: Allows immediate verification of gradient orientation (Red: L-R, Green: A-P, Blue: S-I).
+### 2. DTI Viewer & Quality Control
+- Adds a dedicated **DTI** tab to the BrkRaw Viewer.
+- **DTI Calculation**: Performs real-time tensor fitting using Ordinary Least Squares (OLS).
+- **Visualization**:
+  - Fractional Anisotropy (FA)
+  - Mean Diffusivity (MD)
+  - Directionally Encoded Color FA (DEC-FA)
+- **DEC-FA QC**: Enables immediate visual verification of gradient orientation:
+  - Red: Left-Right (L-R)
+  - Green: Anterior-Posterior (A-P)
+  - Blue: Superior-Inferior (S-I)
 
 ## Usage
 
 ### Conversion
-The hook is automatically selected for scans with diffusion directions (`PVM_DwNDiffDir > 0`).
+The hook is automatically applied to scans with diffusion directions (PVM_DwNDiffDir > 0).
 
 ```bash
 brkraw convert /path/to/study -s 10
 ```
 
 ### Viewer
-Open the viewer and select a DTI scan. The "DTI" tab will appear in the control panel.
+Open the BrkRaw Viewer and select a DTI scan. A **DTI** tab will appear under the Extensions panel.
 
-1.  Click **Calculate DTI**.
-2.  Wait for the calculation to finish.
-3.  Use the dropdown to switch between `FA`, `MD`, `DEC-FA`, and `b0` views.
+Tip: Right-click the extensions tab to detach it into a separate window for easier inspection.
+
+1. Click **Calculate DTI**.
+2. Wait for the tensor fitting to complete.
+3. Use the dropdown menu to switch between FA, MD, DEC-FA, and b0 views.
 
 ## Installation
 
